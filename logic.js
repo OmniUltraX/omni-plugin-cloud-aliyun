@@ -608,6 +608,15 @@ function invokeAction(args) {
   var region = str(action.regionId || action.region || creds.region || DEFAULT_REGION).trim();
   var capability = str(action.capability || "").trim();
   if (!resourceId) throw new Error("缺少 resourceId");
+
+  if (capability === "network.securityGroup" && name === "delete") {
+    rpcCall(creds, "https://ecs." + region + ".aliyuncs.com/", "2014-05-26", "DeleteSecurityGroup", {
+      RegionId: region,
+      SecurityGroupId: resourceId,
+    });
+    return { ok: true, message: "delete " + resourceId };
+  }
+
   var map = {
     start: "StartInstance",
     stop: "StopInstance",
