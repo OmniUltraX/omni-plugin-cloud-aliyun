@@ -50,7 +50,30 @@ function jarr(obj, path) {
     cur = cur[path[i]];
   }
   if (Array.isArray(cur)) return cur;
-  if (cur && typeof cur === "object") return [cur];
+  if (cur && typeof cur === "object") {
+    var keys = Object.keys(cur);
+    if (!keys.length) return [];
+    var numeric = true;
+    for (var n = 0; n < keys.length; n++) {
+      if (!/^\d+$/.test(keys[n])) {
+        numeric = false;
+        break;
+      }
+    }
+    if (numeric) {
+      keys.sort(function (a, b) {
+        return Number(a) - Number(b);
+      });
+      var listed = [];
+      for (var k = 0; k < keys.length; k++) listed.push(cur[keys[k]]);
+      return listed;
+    }
+    return [cur];
+  }
+  if (typeof cur === "string" || typeof cur === "number") {
+    var text = String(cur).trim();
+    return text ? [text] : [];
+  }
   return [];
 }
 
@@ -590,14 +613,259 @@ function listResources(args) {
   return { items: rows };
 }
 
+function mapSgRule(item) {
+  var direction = jstr(item, ["Direction"]).toLowerCase();
+  if (!direction) direction = "ingress";
+  return {
+    id: jstr(item, ["SecurityGroupRuleId", "RuleId"]),
+    direction: direction,
+    protocol: jstr(item, ["IpProtocol", "RuleProtocol"]).toLowerCase(),
+    portRange: jstr(item, ["PortRange", "Port"]),
+    cidr: jstr(item, ["SourceCidrIp", "DestCidrIp", "Ipv6SourceCidrIp", "Ipv6DestCidrIp"]),
+    sourceGroupId: jstr(item, ["SourceGroupId", "DestGroupId"]),
+    policy: jstr(item, ["Policy"]).toLowerCase(),
+    priority: jstr(item, ["Priority"]),
+    nicType: jstr(item, ["NicType"]),
+    description: jstr(item, ["Description", "Remark"]),
+  };
+}
+
+function rulesInBody(body) {
+  var items = jarr(body, ["SecurityGroupRules", "SecurityGroupRule"]);
+  if (!items.length && body && Array.isArray(body.SecurityGroupRules)) items = body.SecurityGroupRules;
+  if (!items.length) items = jarr(body, ["Permissions", "Permission"]);
+  var out = [];
+  for (var i = 0; i < items.length; i++) {
+    var rule = mapSgRule(items[i]);
+    if (rule.id || rule.protocol || rule.cidr || rule.portRange || rule.sourceGroupId) out.push(rule);
+  }
+  return out;
+}
+
+function listSgRules(creds, region, groupId) {
+  var endpoint = "https://ecs." + region + ".aliyuncs.com/";
+  var out = [];
+  var token = "";
+  var guard = 0;
+  while (guard < 50) {
+    guard += 1;
+    var extra = { RegionId: region, SecurityGroupId: groupId, MaxResults: "100" };
+    if (token) extra.NextToken = token;
+    var body = rpcCall(creds, endpoint, "2014-05-26", "DescribeSecurityGroupRules", extra);
+    var page = rulesInBody(body);
+    for (var i = 0; i < page.length; i++) out.push(page[i]);
+    var next = jstr(body, ["NextToken"]);
+    if (!page.length || !next || next === token) break;
+    token = next;
+  }
+  return out;
+}
+
+function listSgMembers(creds, region, groupId) {
+  var endpoint = "https://ecs." + region + ".aliyuncs.com/";
+  var body = rpcCall(creds, endpoint, "2014-05-26", "DescribeInstances", {
+    RegionId: region,
+    SecurityGroupId: groupId,
+    PageNumber: "1",
+    PageSize: "50",
+  });
+  var items = jarr(body, ["Instances", "Instance"]);
+  var related = [];
+  for (var i = 0; i < items.length; i++) {
+    var id = jstr(items[i], ["InstanceId"]);
+    if (!id) continue;
+    var name = jstr(items[i], ["InstanceName"]) || id;
+    related.push({
+      capability: "compute",
+      resourceId: id,
+      name: name,
+      role: "instance",
+    });
+  }
+  return related;
+}
+
+function getSecurityGroup(creds, region, id) {
+  var endpoint = "https://ecs." + region + ".aliyuncs.com/";
+  var attr = rpcCall(creds, endpoint, "2014-05-26", "DescribeSecurityGroupAttribute", {
+    RegionId: region,
+    SecurityGroupId: id,
+  });
+  var detail = fromRow({
+    id: jstr(attr, ["SecurityGroupId"]) || id,
+    name: jstr(attr, ["SecurityGroupName"]) || id,
+    capability: "network.securityGroup",
+    regionId: region,
+    status: "Available",
+    fields: fieldMap([
+      ["vpcId", jstr(attr, ["VpcId"])],
+      ["description", jstr(attr, ["Description"])],
+      ["creationTime", jstr(attr, ["CreationTime"])],
+    ]),
+  });
+  var rules = [];
+  var rulesError = "";
+  try {
+    rules = listSgRules(creds, region, id);
+  } catch (e) {
+    rulesError = str(e && e.message ? e.message : e);
+  }
+  if (!rules.length) {
+    var legacy = rulesInBody(attr);
+    if (legacy.length) {
+      rules = legacy;
+      rulesError = "";
+    }
+  }
+  detail.rules = rules;
+  if (rules.length) detail.fields.ruleCount = String(rules.length);
+  else if (rulesError) detail.fields.rulesError = rulesError;
+  try {
+    detail.related = listSgMembers(creds, region, id);
+    if (detail.related.length) detail.fields.instanceCount = String(detail.related.length);
+  } catch (e2) {
+    /* 成员列表失败不影响规则 */
+  }
+  return detail;
+}
+
+function listDnsRecords(creds, domain) {
+  var out = [];
+  var page = 1;
+  while (page <= 20) {
+    var body = rpcCall(creds, "https://alidns.aliyuncs.com/", "2015-01-09", "DescribeDomainRecords", {
+      DomainName: domain,
+      PageNumber: String(page),
+      PageSize: "100",
+    });
+    var items = jarr(body, ["DomainRecords", "Record"]);
+    for (var i = 0; i < items.length; i++) {
+      var it = items[i];
+      out.push({
+        id: jstr(it, ["RecordId"]),
+        kind: "dnsRecord",
+        name: jstr(it, ["RR"]),
+        status: jstr(it, ["Status"]),
+        fields: fieldMap([
+          ["type", jstr(it, ["Type"])],
+          ["value", jstr(it, ["Value"])],
+          ["ttl", jstr(it, ["TTL"])],
+          ["line", jstr(it, ["Line"])],
+          ["priority", jstr(it, ["Priority"])],
+        ]),
+      });
+    }
+    var total = Number(jstr(body, ["TotalCount"]) || "0");
+    if (!items.length || (total && out.length >= total) || items.length < 100) break;
+    page += 1;
+  }
+  return out;
+}
+
+function domainNameOf(creds, id) {
+  if (id.indexOf(".") >= 0) return id;
+  var rows = listDomains(creds);
+  for (var i = 0; i < rows.length; i++) {
+    if (rows[i].id === id) return rows[i].name || id;
+  }
+  return id;
+}
+
+function getDomain(creds, id) {
+  var rows = listDomains(creds);
+  var row = null;
+  for (var i = 0; i < rows.length; i++) {
+    if (rows[i].id === id || rows[i].name === id) row = rows[i];
+  }
+  if (!row) throw new Error("资源不存在: " + id);
+  var detail = fromRow(row);
+  var domain = row.name || id;
+  try {
+    detail.children = listDnsRecords(creds, domain);
+  } catch (e) {
+    detail.fields.recordsError = str(e && e.message ? e.message : e);
+  }
+  return detail;
+}
+
+function relatedSecurityGroups(creds, region, csv) {
+  var parts = str(csv).split(",");
+  var related = [];
+  for (var i = 0; i < parts.length; i++) {
+    var id = parts[i].trim();
+    if (!id) continue;
+    var name = id;
+    try {
+      var attr = rpcCall(creds, "https://ecs." + region + ".aliyuncs.com/", "2014-05-26", "DescribeSecurityGroupAttribute", {
+        RegionId: region,
+        SecurityGroupId: id,
+      });
+      name = jstr(attr, ["SecurityGroupName"]) || id;
+    } catch (e) {
+      /* 名称查不到时仍保留编号 */
+    }
+    related.push({
+      capability: "network.securityGroup",
+      resourceId: id,
+      name: name,
+      role: "securityGroup",
+    });
+  }
+  return related;
+}
+
+function getCompute(creds, region, id) {
+  var row = null;
+  try {
+    var body = rpcCall(creds, "https://ecs." + region + ".aliyuncs.com/", "2014-05-26", "DescribeInstances", {
+      RegionId: region,
+      InstanceIds: JSON.stringify([id]),
+    });
+    var items = jarr(body, ["Instances", "Instance"]);
+    if (items.length) row = mapEcs(items[0], region);
+  } catch (e) {
+    row = null;
+  }
+  if (!row) {
+    var rows = listEcs(creds, region);
+    for (var i = 0; i < rows.length; i++) {
+      if (rows[i].id === id) row = rows[i];
+    }
+  }
+  if (!row) throw new Error("资源不存在: " + id);
+  var detail = fromRow(row);
+  detail.related = relatedSecurityGroups(creds, region, row.fields && row.fields.securityGroups);
+  var vpc = row.fields && row.fields.vpcId;
+  if (vpc) {
+    detail.related.push({
+      capability: "network.vpc",
+      resourceId: vpc,
+      name: vpc,
+      role: "vpc",
+    });
+  }
+  return detail;
+}
+
 function getResource(args) {
-  var list = listResources(args);
+  var creds = credsOf(args);
+  var capability = str(args.capability || "").trim();
   var id = str(args.resourceId || "").trim();
+  var region = str(args.regionId || args.region || creds.region || DEFAULT_REGION).trim();
+  if (capability === "compute") return getCompute(creds, region, id);
+  if (capability === "network.securityGroup") return getSecurityGroup(creds, region, id);
+  if (capability === "domains" || capability === "dns") return getDomain(creds, id);
+  var list = listResources(args);
   var items = list.items || [];
   for (var i = 0; i < items.length; i++) {
     if (items[i].id === id) return fromRow(items[i]);
   }
   throw new Error("资源不存在: " + id);
+}
+
+function actionParam(action, key) {
+  var params = asObj(action.params);
+  return str(params[key]).trim();
 }
 
 function invokeAction(args) {
@@ -608,6 +876,69 @@ function invokeAction(args) {
   var region = str(action.regionId || action.region || creds.region || DEFAULT_REGION).trim();
   var capability = str(action.capability || "").trim();
   if (!resourceId) throw new Error("缺少 resourceId");
+
+  if (capability === "network.securityGroup" && (name === "authorizerule" || name === "revokerule")) {
+    var egress = actionParam(action, "direction").toLowerCase() === "egress";
+    var api =
+      name === "authorizerule"
+        ? egress
+          ? "AuthorizeSecurityGroupEgress"
+          : "AuthorizeSecurityGroup"
+        : egress
+          ? "RevokeSecurityGroupEgress"
+          : "RevokeSecurityGroup";
+    var extra = { RegionId: region, SecurityGroupId: resourceId };
+    var ruleId = actionParam(action, "ruleId");
+    if (name === "revokerule" && ruleId) {
+      extra["SecurityGroupRuleId.1"] = ruleId;
+    } else {
+      extra.IpProtocol = (actionParam(action, "protocol") || "TCP").toUpperCase();
+      extra.PortRange = actionParam(action, "portRange") || "-1/-1";
+      extra.NicType = actionParam(action, "nicType") || "intranet";
+      if (name === "authorizerule") {
+        extra.Policy = actionParam(action, "policy") || "accept";
+        var priority = actionParam(action, "priority");
+        var description = actionParam(action, "description");
+        if (priority) extra.Priority = priority;
+        if (description) extra.Description = description;
+      }
+      var cidr = actionParam(action, "cidr");
+      if (!cidr && name === "authorizerule") cidr = "0.0.0.0/0";
+      if (cidr) {
+        if (egress) extra.DestCidrIp = cidr;
+        else extra.SourceCidrIp = cidr;
+      }
+    }
+    rpcCall(creds, "https://ecs." + region + ".aliyuncs.com/", "2014-05-26", api, extra);
+    return { ok: true, message: name + " " + resourceId };
+  }
+
+  if ((capability === "domains" || capability === "dns") && name === "addrecord") {
+    rpcCall(creds, "https://alidns.aliyuncs.com/", "2015-01-09", "AddDomainRecord", {
+      DomainName: domainNameOf(creds, resourceId),
+      RR: actionParam(action, "rr") || "@",
+      Type: (actionParam(action, "type") || "A").toUpperCase(),
+      Value: actionParam(action, "value"),
+      TTL: actionParam(action, "ttl") || "600",
+    });
+    return { ok: true, message: "addRecord " + resourceId };
+  }
+  if ((capability === "domains" || capability === "dns") && name === "updaterecord") {
+    rpcCall(creds, "https://alidns.aliyuncs.com/", "2015-01-09", "UpdateDomainRecord", {
+      RecordId: actionParam(action, "recordId"),
+      RR: actionParam(action, "rr") || "@",
+      Type: (actionParam(action, "type") || "A").toUpperCase(),
+      Value: actionParam(action, "value"),
+      TTL: actionParam(action, "ttl") || "600",
+    });
+    return { ok: true, message: "updateRecord " + resourceId };
+  }
+  if ((capability === "domains" || capability === "dns") && name === "deleterecord") {
+    rpcCall(creds, "https://alidns.aliyuncs.com/", "2015-01-09", "DeleteDomainRecord", {
+      RecordId: actionParam(action, "recordId"),
+    });
+    return { ok: true, message: "deleteRecord " + resourceId };
+  }
 
   if (capability === "network.securityGroup" && name === "delete") {
     rpcCall(creds, "https://ecs." + region + ".aliyuncs.com/", "2014-05-26", "DeleteSecurityGroup", {
